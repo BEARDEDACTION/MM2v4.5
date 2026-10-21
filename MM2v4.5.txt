@@ -1,0 +1,714 @@
+local Players = game:GetService("Players")
+local UIS = game:GetService("UserInputService")
+local plr = Players.LocalPlayer
+
+local OFFSET = 5          -- studs below the coin to travel at
+local MAX_COINS = 50      -- reset when bag counter reaches this
+local FIRST_SPEED = 999   -- first coin of the round is a fast snap
+local NO_COIN_DELAY = 2   -- seconds with no coins left before auto reset
+local MENU_KEY = 0x70     -- F1
+local MAX_MISSES = 2      -- failed pickups in a row = bag is full, reset
+
+local coins = 0
+local first = true
+local collected = 0      -- highest coin count seen (GUI or our own count)
+local missed = 0         -- consecutive coins we reached but couldn't collect
+local lastResetTry = 0
+local noCoinSince = nil
+local status = "Starting"
+local roundOver = false
+local lastProgress = tick()
+local activeContainer = nil  -- coin container of the current round
+local lastGui = nil          -- last bag counter value read from the GUI
+local roundEndedAt = 0       -- when the timer last hit 0
+
+-- Settings (changed from the Drawing menu below)
+local cfg = {
+    enabled = true,
+    autoReset = true,
+    speed = 20,
+}
+
+local function getEnabled() return cfg.enabled end
+local function getAutoReset() return cfg.autoReset end
+local function getSpeed() return cfg.speed end
+
+------------------------------------------------------------
+-- Performance helpers
+------------------------------------------------------------
+local ZERO = Vector3.new(0, 0, 0)
+local function zeroVel(part) part.Velocity = ZERO end
+
+local lastProps = {}
+local function setp(obj, key, value)
+    local c = lastProps[obj]
+    if not c then
+        c = {}
+        lastProps[obj] = c
+    end
+    if c[key] ~= value then
+        c[key] = value
+        obj[key] = value
+    end
+end
+
+------------------------------------------------------------
+-- Farm logic
+------------------------------------------------------------
+local function isValid(obj)
+    return obj ~= nil and obj.Parent ~= nil
+end
+
+-- Uses the "Alive" attribute; falls back to Humanoid health if it isn't set.
+local function isAlive()
+    local attr = plr:GetAttribute("Alive")
+    if attr ~= nil then
+        return attr == true
+    end
+    local char = plr.Character
+    local hum = char and char:FindFirstChild("Humanoid")
+    return hum ~= nil and hum.Health > 0
+end
+
+local function getTimeLeft()
+    local rtp = workspace:FindFirstChild("RoundTimerPart")
+    return rtp and tonumber(rtp:GetAttribute("Time"))
+end
+
+local function dist(a, b)
+    local dx, dy, dz = a.X - b.X, a.Y - b.Y, a.Z - b.Z
+    return math.sqrt(dx * dx + dy * dy + dz * dz)
+end
+
+local noclipChar, noclipParts = nil, {}
+local lastNoclip, lastNoclipRebuild = 0, 0
+
+local function setNoclip()
+    local now = tick()
+    if now - lastNoclip < 0.2 then return end
+    lastNoclip = now
+
+    local char = plr.Character
+    if not char then return end
+
+    if char ~= noclipChar or now - lastNoclipRebuild > 2 then
+        noclipChar, noclipParts, lastNoclipRebuild = char, {}, now
+        for _, part in ipairs(char:GetChildren()) do
+            if part:IsA("BasePart") then
+                noclipParts[#noclipParts + 1] = part
+            end
+        end
+    end
+
+    for _, part in ipairs(noclipParts) do
+        pcall(function() part.CanCollide = false end)
+    end
+end
+
+local cachedContainer = nil
+local lastContainer = nil
+local lastScan = 0
+
+-- Clears everything tied to the previous round/life.
+local function resetRoundState()
+    coins, collected, missed = 0, 0, 0
+    lastGui = nil
+    first = true
+    noCoinSince = nil
+    lastProgress = tick()
+end
+
+local function hasCoins(container)
+    for _, obj in ipairs(container:GetChildren()) do
+        if obj.Name == "Coin_Server" then return true end
+    end
+    return false
+end
+
+-- Old maps can linger in workspace, so prefer a CoinContainer that really
+-- has coins in it, and re-scan whenever the cached one goes empty/stale.
+local function findCoinContainer()
+    if isValid(cachedContainer) then return cachedContainer end
+    cachedContainer = nil
+    if tick() - lastScan < 0.5 then
+        return isValid(lastContainer) and lastContainer or nil
+    end
+    lastScan = tick()
+
+    local fallback = nil
+    for _, obj in ipairs(workspace:GetChildren()) do
+        if obj.ClassName == "Model" then
+            local container = obj:FindFirstChild("CoinContainer")
+            if container then
+                if hasCoins(container) then
+                    cachedContainer, lastContainer = container, container
+                    return container
+                end
+                fallback = fallback or container
+            end
+        end
+    end
+    cachedContainer, lastContainer = fallback, fallback or lastContainer
+    return fallback
+end
+
+-- Tries Health = 0 first, then the Roblox menu reset, until the character dies.
+local function resetCharacter()
+    local char = plr.Character
+    if not char then return false end
+    local hum = char:FindFirstChildOfClass("Humanoid") or char:FindFirstChild("Humanoid")
+
+    -- 1) Health = 0
+    if hum then pcall(function() hum.Health = 0 end) end
+    wait(0.5)
+    if not isAlive() then return true end
+
+    -- 2) Roblox menu reset: Esc, R, Enter
+    pcall(function()
+        keypress(0x1B) wait(0.1) keyrelease(0x1B) wait(0.3)
+        keypress(0x52) wait(0.1) keyrelease(0x52) wait(0.3)
+        keypress(0x0D) wait(0.1) keyrelease(0x0D)
+    end)
+    for _ = 1, 20 do
+        wait(0.1)
+        if not isAlive() then return true end
+    end
+    return false
+end
+
+------------------------------------------------------------
+-- Coin bag reading (normal bag + candy/event bag)
+------------------------------------------------------------
+local function getBags()
+    local ok, bags = pcall(function()
+        return plr.PlayerGui.MainGUI.Game.CoinBags.Container
+    end)
+    return ok and bags or nil
+end
+
+-- Reads the highest bag counter from the GUI. If the counter drops compared
+-- to the last read, the bag was reset (new round), so our count follows it.
+local function readCoins()
+    local bags = getBags()
+    if bags then
+        pcall(function()
+            local guiMax = nil
+            for _, d in ipairs(bags:GetDescendants()) do
+                if d.Name == "Coins" and d:IsA("TextLabel") then
+                    local n = tonumber(string.match(tostring(d.Text), "%d+"))
+                    if n and (not guiMax or n > guiMax) then guiMax = n end
+                end
+            end
+            if guiMax then
+                -- bag counter dropped = new round / bag reset
+                if lastGui and guiMax < lastGui then collected = guiMax end
+                lastGui = guiMax
+                if guiMax > collected then collected = guiMax end
+            end
+        end)
+    end
+    return collected
+end
+
+-- True when any visible bag label says "Full" (throttled, GUI scans are costly)
+local lastFullCheck, lastFullResult = 0, false
+local function bagFull()
+    local now = tick()
+    if now - lastFullCheck < 0.25 then return lastFullResult end
+    lastFullCheck = now
+
+    local full = false
+    local bags = getBags()
+    if bags then
+        pcall(function()
+            for _, d in ipairs(bags:GetDescendants()) do
+                if d:IsA("TextLabel") and d.Visible and string.find(tostring(d.Text), "Full") then
+                    full = true
+                    break
+                end
+            end
+        end)
+    end
+    lastFullResult = full
+    return full
+end
+
+local function getClosestCoin(container, origin)
+    local best, bestDist = nil, math.huge
+    for _, obj in ipairs(container:GetChildren()) do
+        if isValid(obj) and obj.Name == "Coin_Server" and obj:FindFirstChild("TouchInterest") then
+            local d = dist(obj.Position, origin)
+            if d < bestDist then
+                best, bestDist = obj, d
+            end
+        end
+    end
+    return best
+end
+
+-- Moves hrp toward coin. Returns true only if we arrived while the coin was still up for grabs.
+local function tween(hrp, coin, spd)
+    local sp = hrp.Position
+    local tp = coin.Position
+    local sx, sy, sz = sp.X, sp.Y - OFFSET, sp.Z
+    local tx, ty, tz = tp.X, tp.Y - OFFSET, tp.Z
+
+    local duration = math.max(dist(sp, tp) / spd, 0.05)
+    local t0 = tick()
+    local lastCheck = 0
+
+    while true do
+        local now = tick()
+
+        if not isValid(hrp) or not isValid(coin) or not getEnabled() then
+            return false
+        end
+
+        -- Slower checks (every 0.1s): alive state and coin still up for grabs
+        if now - lastCheck > 0.1 then
+            lastCheck = now
+            if not isAlive() then return false end
+            if not coin:FindFirstChild("TouchInterest") then
+                return false
+            end
+            pcall(zeroVel, hrp)
+        end
+
+        local alpha = (now - t0) / duration
+        if alpha >= 1 then break end
+
+        setNoclip()
+        hrp.Position = Vector3.new(
+            sx + (tx - sx) * alpha,
+            sy + (ty - sy) * alpha,
+            sz + (tz - sz) * alpha
+        )
+        wait()
+    end
+
+    if isValid(hrp) and isValid(coin) and coin:FindFirstChild("TouchInterest") then
+        hrp.Position = coin.Position
+        return true
+    end
+    return false
+end
+
+-- Resets the character. Retries every 3s until the character actually dies.
+local function doReset(reason)
+    if not getAutoReset() or tick() - lastResetTry < 3 then
+        return false
+    end
+    -- never reset in lobby/intermission or while already dead
+    local t = getTimeLeft()
+    if (t and t <= 0) or not isAlive() then return false end
+    lastResetTry = tick()
+    status = "Resetting"
+    if resetCharacter() then
+        notify(reason .. ", reset done", "Coin Farm", 2)
+        return true
+    end
+    warn("[CoinFarm] Reset failed, will retry")
+    return false
+end
+
+local function step()
+    if not getEnabled() then
+        noCoinSince = nil
+        status = "Disabled"
+        return wait(0.25)
+    end
+
+    local timeLeft = getTimeLeft()
+    if timeLeft and timeLeft <= 0 then
+        if not roundOver then
+            roundOver = true
+            roundEndedAt = tick()
+            resetRoundState()
+            cachedContainer = nil
+        end
+        status = "Waiting for round"
+
+        -- don't touch workspace while the old map is being torn down
+        if tick() - roundEndedAt < 3 then
+            return wait(0.5)
+        end
+
+        -- Only idle if there is really nothing to farm
+        local cont = findCoinContainer()
+        local c = plr.Character
+        local h = c and c:FindFirstChild("HumanoidRootPart")
+        if not (cont and h and getClosestCoin(cont, h.Position)) then
+            return wait(0.5)
+        end
+    else
+        roundOver = false
+    end
+
+    if not isAlive() then
+        first = true
+        collected, missed = 0, 0
+        lastGui = nil
+        noCoinSince = nil
+        status = "Dead"
+        return wait(0.25)
+    end
+
+    coins = readCoins()
+
+    -- Bag full: the counter hit the max, a bag label says "Full", or we keep
+    -- reaching coins that won't get collected. Reset instead of teleporting
+    -- to the same coin.
+    if coins >= MAX_COINS or bagFull() or missed >= MAX_MISSES then
+        status = "Bag full"
+        doReset("Bag full")
+        return wait(0.5)
+    end
+
+    -- Watchdog: alive but nothing happening for 15s -> clear cached state
+    if tick() - lastProgress > 15 then
+        lastProgress = tick()
+        cachedContainer = nil
+        first = true
+        noCoinSince = nil
+    end
+
+    local container = findCoinContainer()
+    if not container then
+        status = "No coin container"
+        return wait(0.25)
+    end
+
+    -- New map/container = new round, wipe the old round's state
+    if container ~= activeContainer then
+        activeContainer = container
+        resetRoundState()
+    end
+
+    local char = plr.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if not hrp then
+        status = "No character"
+        return wait(0.25)
+    end
+
+    local coin = getClosestCoin(container, hrp.Position)
+    if not coin then
+        noCoinSince = noCoinSince or tick()
+        cachedContainer = nil -- may be stale (new round/new map), re-scan
+        status = "No coins"
+        if coins > 0 and tick() - noCoinSince > NO_COIN_DELAY then
+            doReset("No coins left")
+        end
+        return wait(0.1)
+    end
+    noCoinSince = nil
+
+    status = "Farming"
+    setNoclip()
+    local spd = first and FIRST_SPEED or getSpeed()
+    if tween(hrp, coin, spd) then
+        first = false
+        lastProgress = tick()
+
+        -- Stay on the coin until the server removes it (scaled by ping),
+        -- so the touch actually registers before we move on.
+        local ping = 0
+        pcall(function() ping = tonumber(GetPingValue()) or 0 end)
+        local deadline = tick() + math.min(1.5, 0.3 + (ping / 1000) * 2)
+        local cp = coin.Position
+        local got, aborted = false, false
+
+        while tick() < deadline do
+            if not isValid(container) then aborted = true break end -- map deleted = round ended
+            if not isValid(coin) or not coin:FindFirstChild("TouchInterest") then
+                got = true
+                break
+            end
+            if not isValid(hrp) or not isAlive() or not getEnabled() then break end
+            hrp.Position = cp
+            wait()
+        end
+
+        if aborted then
+            resetRoundState()
+        elseif got then
+            collected = collected + 1
+            missed = 0
+        elseif isAlive() and getEnabled() then
+            missed = missed + 1
+        end
+    end
+    wait()
+end
+
+------------------------------------------------------------
+-- Drawing menu (F1 show/hide, drag the title area to move)
+-- Hotkeys: F2 farm, F3 auto reset, F4/F5 speed -/+
+------------------------------------------------------------
+local MENU_W, MENU_H, DRAG_H = 240, 210, 40
+local menuX, menuY = 120, 120
+local menuVisible = true
+
+local C_SHADOW = Color3.fromRGB(0, 0, 0)
+local C_BG     = Color3.fromRGB(22, 22, 29)
+local C_ROW    = Color3.fromRGB(33, 33, 44)
+local C_BTN    = Color3.fromRGB(52, 52, 70)
+local C_BTN_HI = Color3.fromRGB(78, 78, 104)
+local C_ACCENT = Color3.fromRGB(135, 100, 255)
+local C_TEXT   = Color3.fromRGB(238, 238, 245)
+local C_DIM    = Color3.fromRGB(150, 150, 168)
+local C_ON     = Color3.fromRGB(70, 200, 120)
+local C_OFF    = Color3.fromRGB(205, 75, 85)
+
+local elements = {}   -- { obj, rx, ry }
+local updaters = {}   -- run every frame while visible
+local hits = {}       -- clickable regions
+local warnedProps = {}
+
+local function draw(kind, rx, ry, props, z)
+    local d = Drawing.new(kind)
+    pcall(function() d.Transparency = 1 end)
+    for k, v in pairs(props) do
+        local ok = pcall(function() d[k] = v end)
+        if not ok and not warnedProps[k] then
+            warnedProps[k] = true
+            warn("[CoinFarm] Unsupported " .. kind .. " property: " .. tostring(k))
+        end
+    end
+    if kind == "Text" then
+        if not pcall(function() d.FontSize = 14 end) then
+            pcall(function() d.Size = 14 end)
+        end
+    end
+    pcall(function() d.ZIndex = z or 1 end)
+    d.Visible = false
+    local e = { obj = d, rx = rx, ry = ry }
+    elements[#elements + 1] = e
+    return d, e
+end
+
+local function rect(rx, ry, w, h, color, corner, z, transparency)
+    return draw("Square", rx, ry, {
+        Size = Vector2.new(w, h), Filled = true, Color = color,
+        Corner = corner or 0, Transparency = transparency or 1,
+    }, z)
+end
+
+local function label(text, rx, ry, color)
+    return draw("Text", rx, ry, { Text = text, Color = color or C_TEXT, Outline = false, Center = false }, 6)
+end
+
+local function centerText(text, rx, ry, color)
+    return draw("Text", rx, ry, { Text = text, Color = color or C_TEXT, Outline = false, Center = true }, 6)
+end
+
+local function hit(rx, ry, w, h, fn, obj, base, hover)
+    hits[#hits + 1] = { rx = rx, ry = ry, w = w, h = h, fn = fn, obj = obj, base = base, hover = hover }
+end
+
+local function addToggle(text, ry, key)
+    rect(10, ry, MENU_W - 20, 30, C_ROW, 8, 2)
+    label(text, 22, ry + 8)
+    local tx = MENU_W - 62
+    local track = rect(tx, ry + 6, 40, 18, C_OFF, 9, 3)
+    local _, knobE = draw("Circle", tx + 9, ry + 15, {
+        Radius = 7, Filled = true, NumSides = 24, Color = C_TEXT,
+    }, 4)
+    hit(10, ry, MENU_W - 20, 30, function() cfg[key] = not cfg[key] end)
+    updaters[#updaters + 1] = function()
+        local on = cfg[key]
+        setp(track, "Color", on and C_ON or C_OFF)
+        knobE.rx = tx + (on and 31 or 9)
+    end
+end
+
+-- Shadow, panel, title
+rect(3, 5, MENU_W, MENU_H, C_SHADOW, 14, 0, 0.35)
+rect(0, 0, MENU_W, MENU_H, C_BG, 14, 1)
+label("Coin Farm", 16, 11, C_TEXT)
+label("F1", MENU_W - 32, 11, C_DIM)
+rect(16, 34, MENU_W - 32, 2, C_ACCENT, 1, 2)
+
+addToggle("Farm", 46, "enabled")
+addToggle("Auto Reset", 82, "autoReset")
+
+-- Speed row
+rect(10, 118, MENU_W - 20, 30, C_ROW, 8, 2)
+label("Speed", 22, 126)
+local minus = rect(MENU_W - 112, 123, 26, 20, C_BTN, 6, 3)
+centerText("-", MENU_W - 99, 126)
+local plus = rect(MENU_W - 44, 123, 26, 20, C_BTN, 6, 3)
+centerText("+", MENU_W - 31, 126)
+local speedText = centerText("", MENU_W - 65, 126)
+local function changeSpeed(delta)
+    cfg.speed = math.max(5, math.min(60, cfg.speed + delta))
+end
+hit(MENU_W - 112, 123, 26, 20, function() changeSpeed(-5) end, minus, C_BTN, C_BTN_HI)
+hit(MENU_W - 44, 123, 26, 20, function() changeSpeed(5) end, plus, C_BTN, C_BTN_HI)
+updaters[#updaters + 1] = function() setp(speedText, "Text", tostring(cfg.speed)) end
+
+-- Status
+local statusText = label("", 16, 164, C_DIM)
+local hintText = label("F2-F5 hotkeys", 16, 184, C_DIM)
+updaters[#updaters + 1] = function()
+    setp(statusText, "Text", "Status: " .. status)
+end
+
+-- Cursor dot (confirms the mouse position is being read)
+local cursor = Drawing.new("Circle")
+pcall(function()
+    cursor.Radius = 4
+    cursor.Filled = true
+    cursor.NumSides = 16
+    cursor.Color = C_TEXT
+    cursor.ZIndex = 20
+end)
+cursor.Visible = false
+
+local function setMenuVisible(state)
+    for _, e in ipairs(elements) do
+        e.obj.Visible = state
+    end
+    if not state then
+        cursor.Visible = false
+        lastProps[cursor] = nil
+    end
+end
+
+local function layout()
+    for _, e in ipairs(elements) do
+        local x, y = menuX + e.rx, menuY + e.ry
+        if e.lx ~= x or e.ly ~= y then
+            e.lx, e.ly = x, y
+            e.obj.Position = Vector2.new(x, y)
+        end
+    end
+end
+
+local function getMouse()
+    local ok, pos = pcall(function() return UIS:GetMouseLocation() end)
+    if ok and pos then return pos.X, pos.Y end
+    local ok2, x, y = pcall(function()
+        local m = plr:GetMouse()
+        return m.X, m.Y + 36
+    end)
+    if ok2 and x and y then return x, y end
+    return nil, nil
+end
+
+local function inRect(mx, my, x, y, w, h)
+    return mx >= x and mx <= x + w and my >= y and my <= y + h
+end
+
+local hotkeys = {
+    { 0x71, function() cfg.enabled = not cfg.enabled end },
+    { 0x72, function() cfg.autoReset = not cfg.autoReset end },
+    { 0x73, function() changeSpeed(-5) end },
+    { 0x74, function() changeSpeed(5) end },
+}
+
+local wasF1, wasDown, dragging = false, false, false
+local wasKey = {}
+local dragOX, dragOY = 0, 0
+local warnedMouse = false
+local lastMX, lastMY = -1, -1
+
+local function menuStep()
+    local active = isrbxactive()
+
+    local f1 = active and iskeypressed(MENU_KEY)
+    if f1 and not wasF1 then
+        menuVisible = not menuVisible
+        setMenuVisible(menuVisible)
+    end
+    wasF1 = f1 and true or false
+
+    if active then
+        for _, hk in ipairs(hotkeys) do
+            local pressed = iskeypressed(hk[1]) and true or false
+            if pressed and not wasKey[hk[1]] then hk[2]() end
+            wasKey[hk[1]] = pressed
+        end
+    end
+
+    if not menuVisible then
+        dragging = false
+        return
+    end
+
+    for _, fn in ipairs(updaters) do fn() end
+
+    local mx, my = getMouse()
+    if mx then
+        if mx ~= lastMX or my ~= lastMY then
+            lastMX, lastMY = mx, my
+            cursor.Position = Vector2.new(mx, my)
+        end
+        setp(cursor, "Visible", true)
+        setp(hintText, "Text", "F2-F5 hotkeys")
+    else
+        setp(cursor, "Visible", false)
+        setp(hintText, "Text", "Mouse N/A - use F2-F5")
+        if not warnedMouse then
+            warnedMouse = true
+            warn("[CoinFarm] Could not read mouse position; use F2-F5 hotkeys.")
+        end
+    end
+
+    -- Only accept clicks while the Roblox window is focused
+    local down = active and (mx ~= nil) and ismouse1pressed() and true or false
+
+    -- hover highlight
+    for _, h in ipairs(hits) do
+        if h.obj then
+            local over = mx and inRect(mx, my, menuX + h.rx, menuY + h.ry, h.w, h.h)
+            setp(h.obj, "Color", over and h.hover or h.base)
+        end
+    end
+
+    if down and not wasDown then
+        if inRect(mx, my, menuX, menuY, MENU_W, DRAG_H) then
+            dragging = true
+            dragOX, dragOY = mx - menuX, my - menuY
+        else
+            for _, h in ipairs(hits) do
+                if inRect(mx, my, menuX + h.rx, menuY + h.ry, h.w, h.h) then
+                    h.fn()
+                    break
+                end
+            end
+        end
+    elseif down and dragging then
+        menuX, menuY = mx - dragOX, my - dragOY
+    end
+    if not down then dragging = false end
+    wasDown = down
+
+    layout()
+end
+
+layout()
+setMenuVisible(true)
+
+task.spawn(function()
+    while true do
+        local ok, err = pcall(menuStep)
+        if not ok then
+            warn("[CoinFarm menu] " .. tostring(err))
+            wait(1)
+        end
+        wait(0.03)
+    end
+end)
+
+task.spawn(function()
+    while true do
+        local ok, err = pcall(step)
+        if not ok then
+            warn("[CoinFarm] " .. tostring(err))
+            wait(1)
+        end
+    end
+end)
+
+notify("Coin farm loaded. F1 hides/shows the menu.", "Coin Farm", 4)

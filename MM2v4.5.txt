@@ -33,6 +33,16 @@ local function getEnabled() return cfg.enabled end
 local function getAutoReset() return cfg.autoReset end
 local function getSpeed() return cfg.speed end
 
+-- Debug log (written to the Matcha workspace folder, survives a freeze/crash)
+local LOGFILE = "coinfarm_log.txt"
+local logStart = tick()
+pcall(function() writefile(LOGFILE, "log start\n") end)
+local function log(msg)
+    pcall(function()
+        appendfile(LOGFILE, string.format("[%.1f] %s\n", tick() - logStart, tostring(msg)))
+    end)
+end
+
 ------------------------------------------------------------
 -- Performance helpers
 ------------------------------------------------------------
@@ -298,9 +308,13 @@ local function doReset(reason)
     if not getAutoReset() or tick() - lastResetTry < 3 then
         return false
     end
+    log("doReset reason=" .. tostring(reason) .. " collected=" .. tostring(collected) .. " missed=" .. tostring(missed))
     -- never reset in lobby/intermission or while already dead
     local t = getTimeLeft()
-    if (t and t <= 0) or not isAlive() then return false end
+    if (t and t <= 0) or not isAlive() then
+        log("doReset BLOCKED timer=" .. tostring(t) .. " alive=" .. tostring(isAlive()))
+        return false
+    end
     lastResetTry = tick()
     status = "Resetting"
     if resetCharacter() then
@@ -323,6 +337,7 @@ local function step()
         if not roundOver then
             roundOver = true
             roundEndedAt = tick()
+            log("round end: timer <= 0")
             resetRoundState()
             cachedContainer = nil
         end
@@ -349,6 +364,7 @@ local function step()
         collected, missed = 0, 0
         lastGui = nil
         noCoinSince = nil
+        if status ~= "Dead" then log("became dead, timer=" .. tostring(timeLeft)) end
         status = "Dead"
         return wait(0.25)
     end
@@ -358,9 +374,10 @@ local function step()
     -- Bag full: the counter hit the max, a bag label says "Full", or we keep
     -- reaching coins that won't get collected. Reset instead of teleporting
     -- to the same coin.
-    if coins >= MAX_COINS or bagFull() or missed >= MAX_MISSES then
+    local fullNow = bagFull()
+    if coins >= MAX_COINS or fullNow or missed >= MAX_MISSES then
         status = "Bag full"
-        doReset("Bag full")
+        doReset("Bag full c=" .. coins .. " gui=" .. tostring(fullNow) .. " miss=" .. missed)
         return wait(0.5)
     end
 
@@ -381,6 +398,7 @@ local function step()
     -- New map/container = new round, wipe the old round's state
     if container ~= activeContainer then
         activeContainer = container
+        log("new container detected")
         resetRoundState()
     end
 
@@ -430,12 +448,14 @@ local function step()
         end
 
         if aborted then
+            log("container vanished mid-pickup")
             resetRoundState()
         elseif got then
             collected = collected + 1
             missed = 0
         elseif isAlive() and getEnabled() then
             missed = missed + 1
+            log("missed coin, missed=" .. missed)
         end
     end
     wait()
@@ -708,6 +728,19 @@ task.spawn(function()
             warn("[CoinFarm] " .. tostring(err))
             wait(1)
         end
+    end
+end)
+
+task.spawn(function()
+    while true do
+        pcall(function()
+            -- line 1 touches no instances: if the log ends here, the next line froze
+            log("hb status=" .. tostring(status) .. " coins=" .. tostring(coins) .. " collected=" .. tostring(collected) .. " missed=" .. tostring(missed))
+            local t = getTimeLeft()
+            local attr = plr:GetAttribute("Alive")
+            log("   timer=" .. tostring(t) .. " alive=" .. tostring(isAlive()) .. " aliveAttr=" .. tostring(attr) .. " container=" .. tostring(isValid(cachedContainer)))
+        end)
+        wait(0.5)
     end
 end)
 
